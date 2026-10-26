@@ -1051,11 +1051,11 @@ void qsa_topk(const float *scores, int64_t ld, int64_t T, int64_t pos0, int64_t 
         STRIX_HIP_CHECK_LAUNCH(fn, " filter exact T=", T, " pos0=", pos0, " k=", k);
         return;
     }
-    // Auto (gfx1151): row up to 16384 blocks; past that coop for verifies (T = 5: 27.8 /
-    // 41.1 / 46.8 us at 16k / 32k / 64k blocks vs split 50.4 / 56.3 / 52.0) and for T = 1 up to 40960 blocks (23.7 /
-    // 28.5 vs 31.2 / 31.8); T = 1 deeper keeps split (64k: coop 45.4 vs split 32.3).
-    const bool coop_auto = small_t && nb > kQsaTopkRowMaxBlocks && (T > 1 || nb <= kQsaTopkCoopMaxBlocksT1);
-    if (path == TopkPath::Coop || (path == TopkPath::Auto && coop_auto)) {
+    // Avoid cooperative grid barriers in the serving Auto path. On gfx1151/ROCm the
+    // real 163152-token recovery request stalls inside hipLaunchCooperativeKernel
+    // for its final T=5 at pos0=163147. Split selects the same sorted block indices
+    // with separate ordered launches. Keep explicit Coop for isolated diagnosis.
+    if (path == TopkPath::Coop) {
         STRIX_CHECK(small_t, fn, ": the coop path takes T <= ", kQsaTopkRowMaxT, ", got T = ", T);
         const int64_t W = std::clamp<int64_t>(std::min<int64_t>((nb + kTopkChunk - 1) / kTopkChunk,
                                                                   coop_max_resident() / T),
