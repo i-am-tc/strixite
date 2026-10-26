@@ -66,9 +66,9 @@ void qsa_scores(const void *q, int64_t q_ts, int64_t q_hs, int64_t T, int64_t po
 // more than k blocks - three histogram passes, the select, a per-row sort - else 1), for many queries (prefill);
 // Row - one workgroup per query, one launch (the passes over the row in LDS, the select in index order so no
 // sort), for decode and verifies (T <= kQsaTopkRowMaxT), where Split's cost was its launches. Auto picks Row for
-// rows of at most kQsaTopkRowMaxBlocks blocks (any T: prefill chunks too, 3-8x faster than Split there), Coop for small T past that (the split's
-// workgroups in one cooperative launch: grid syncs between the passes, a select in index order - no sort); either can be forced
-// explicitly. Measured (gfx1151, T = 1): Row 7.3 / 12.5 / 33.8 / 64.0 / 124.0 us at 1k / 4k /
+// rows of at most kQsaTopkRowMaxBlocks blocks (any T: prefill chunks too, 3-8x faster than Split there), Split for small T past that.
+// Coop remains explicit for diagnosis: its cooperative grid barriers can hang on gfx1151
+// during long-context serving. Measured (gfx1151, T = 1): Row 7.3 / 12.5 / 33.8 / 64.0 / 124.0 us at 1k / 4k /
 // 16k / 32k / 64k blocks, Split 30.5-32.5 us throughout - one workgroup streaming a long row loses to the split's
 // parallel passes past ~14k blocks (~56k tokens of context). With the select from per-thread slices (T = 1):
 // Row 6.9 / 8.6 / 14.3 / 29.4 us at 1k / 4k / 16k / 32k blocks; T = 5 14.6 at 16k, 55.4 at 32k - so Row up to 16384
