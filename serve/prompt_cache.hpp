@@ -7,8 +7,8 @@
 // RAM tier: put() keeps the state's HostBuffer in RAM (no disk write); a lookup that hits RAM hands that buffer to the
 // import directly (no copy, no disk). Its size follows free memory: after every put, least recently used entries
 // leave RAM while MemAvailable is below ram_margin. An entry leaving RAM is written to disk if it isn't there yet
-// and the write rules allow it, else it is gone (a miss later, a re-prefill - never a wrong state). A Turn replaced by
-// the next turn of its conversation is dropped while still in RAM, so a tool loop's turns never reach the disk.
+// and the write rules allow it, else it is gone (a miss later, a re-prefill - never a wrong state). Old Turns outside
+// the conversation's retained window are dropped; retained Turns remain ordinary evictable RAM/disk entries.
 //
 // Write rules: an entry is written (1) when RAM evicts it, (2) when it has sat idle in RAM for
 // idle_seconds (in the background; it stays in RAM), (3) at clean shutdown (the destructor, newest first, within
@@ -28,9 +28,14 @@
 // Kinds: System = the prefix up to the first message after the system prompt (shared by every conversation with
 // that system prompt); Turn = a conversation up to its last generation prompt; Checkpoint = a conversation up to
 // the start of its last user message (saved for prompts ending in the user's message, not tool results). A new
-// Turn or Checkpoint replaces the Turn entries it extends (RAM and disk), never a Checkpoint: an agent's tool loop
-// keeps one entry while the conversation's user messages each keep theirs, so a client that later rewrites earlier
-// history (e.g. strips a reminder it appended to the previous user message) still resumes from the checkpoint.
+// Turn or Checkpoint retires only Turn ancestors outside turns_per_chain. The latest turns remain available when a
+// client rewrites a recent tool result (e.g. hides an image); every candidate must still match its entire prefix.
+// User-message Checkpoints have their own retention count. Neither kind is pinned against RAM/disk eviction.
+// Branches a conversation left: a Turn put names its conversation (put's conversation_n: the prompt up to the end of
+// its first message after the system prompt). The conversation's other Turns that are not this one's prefixes - the
+// turns before a rewritten message (a hidden image), an abandoned regeneration - are superseded: they stay in RAM
+// while it fits and still serve a client that returns to them (a hit makes them ordinary again), but leave RAM and
+// disk first and are never written. Conversations that only share the system prompt differ inside conversation_n.
 //
 // RAM-only entries (put(..., ram_only = true)): the engine marks those of one-shot requests - one message, no tools,
 // nothing a later turn extends (a batch client's classification prompts). They serve repeats from RAM but never reach
@@ -48,7 +53,7 @@
 // delta stays within delta_max_tokens and a quarter of the base (else the Turn is saved whole and becomes the next
 // base - a rebase). Deltas never chain: a resume is base + one delta (with_state hands both, base first). Rules:
 // - a delta lives only while its base does: removing a base removes its deltas (RAM and disk);
-// - a new Turn replaces the Turns it extends except its own base, and a base's buffer is never handed out for reuse;
+// - old Turns beyond the retained window go except bases needed by surviving deltas or the incoming save;
 // - a delta reaches the disk only with its base: writing one writes the base first if it isn't there (the budget
 //   counts both); at startup a delta file whose base file is missing is dropped (counted invalid);
 // - using or saving a delta refreshes its base's place in the LRU, so the two leave RAM together;
@@ -94,6 +99,8 @@ struct PromptCacheStats {
     int64_t ram_evicted = 0;  // entries that left RAM for lack of memory (written, already on disk, or dropped)
     int64_t ram_evicted_watch = 0;  // of those, by the writer's margin watch (another process grew between saves)
     int64_t ram_only_dropped = 0;  // RAM-only entries that left RAM (never written, by design)
+    int64_t superseded = 0;        // Turns of branches their conversation left (marked by a put, see "Kinds")
+    int64_t superseded_dropped = 0;  // superseded entries that left RAM unwritten
     int64_t rejected_space = 0, rejected_budget = 0, rejected_queue = 0;  // eviction writes refused, by reason
     int64_t room_refused = 0;  // make_room_for found no room: a save skipped or a disk load refused
     int64_t room_waits = 0;    // make_room_for waited for evicted entries' writes to give their RAM back (polls)
@@ -132,6 +139,7 @@ public:
         uint64_t disk_free_margin = 32ull << 30;  // a write never leaves less free space on the cache's filesystem
         double shutdown_seconds = 40;       // the destructor's flush stops after this long
         int checkpoints_per_chain = 2;      // Checkpoints kept per conversation (>= 1)
+        int turns_per_chain = 4;            // recent generation-prompt endpoints, including the newest (1..64)
         // Delta entries: a Turn is a delta on its base while it adds at most this many tokens (and at most a quarter of
         // the base's); 0 = every entry whole. 65536 (was 32768): below a 262k base the quarter rule
         // decides - a delta of <= ~1.4 GB (27 KiB a token + ~0.12 GB) instead of a whole rebase every 32k tokens.
@@ -191,26 +199,27 @@ public:
     // The base a Turn of tokens[0, n) should be saved as a delta on: its length (export the delta from there and put
     // with that base_n), or 0 = save it whole. See "Delta entries" above.
     int64_t delta_base(const int32_t *tokens, int64_t n, Kind kind) const;
-    // Adds an entry in RAM (a duplicate only refreshes the existing one; its buffer becomes a spare), replacing the
-    // turns it extends, then makes room in RAM. ram_only: never written to disk (see "RAM-only entries" above).
+    // Adds an entry in RAM (a duplicate only refreshes the existing one; its buffer becomes a spare), retaining the
+    // recent Turn ancestors, then makes room in RAM. ram_only: never written to disk (see "RAM-only entries" above).
     // base_n > 0: state is a delta on the full entry of tokens[0, base_n) (delta_base()); if that base is gone since,
     // the state is dropped (logged) and put returns false. saved_by: the request that saved it, for the log lines
-    // about the entry later (0: none).
+    // about the entry later (0: none). conversation_n > 0 (a Turn): tokens[0, conversation_n) identify the
+    // conversation, whose other branches this put supersedes (see "Kinds"); 0 = none.
     bool put(std::vector<int32_t> tokens, Kind kind, HostBuffer state, bool ram_only = false, int64_t base_n = 0,
-             int64_t saved_by = 0);
+             int64_t saved_by = 0, int64_t conversation_n = 0);
     // A spare buffer (the largest; empty if none) for an export or a load, resized by whoever fills it - and back.
     // Near the margin with no spare of the last saved state's size, the least recently used RAM entry already on
     // disk gives up its buffer instead (no fresh mapping under memory pressure).
     HostBuffer take_buffer();
-    // The RAM buffer of the Turn entry a put of tokens[0, n) will replace (the longest Turn it extends - the same
-    // conversation one step back), taken now: that entry leaves the index (RAM and disk) as the put would do anyway.
+    // A RAM buffer from a Turn ancestor the incoming put would retire, taken now. Recent retained Turns are never
+    // consumed here. That entry leaves the index (RAM and disk) as the put would do anyway.
     // The export then grows it by the turn's few MB instead of populating a fresh multi-GB buffer - near the RAM
     // margin spares are the first thing dropped, so there usually is none (2-6 GB exports took 278-546 ms
     // median). Empty if there is no such entry in RAM, or it is being read or written: use take_buffer(). If the
     // export then fails, the old turn is lost - a miss later, never a wrong state. Never a base: neither one with
     // deltas nor the entry of tokens[0, keep_n) - the base the coming put will name (delta_base()), whose old delta
     // this call may just have taken.
-    HostBuffer take_replaced_buffer(const int32_t *tokens, int64_t n, int64_t keep_n = 0);
+    HostBuffer take_replaced_buffer(const int32_t *tokens, int64_t n, int64_t keep_n = 0, Kind incoming = Kind::Turn);
     // Before a buffer grows by `bytes` (an export into a taken buffer, a disk load): spares and least recently used
     // entries leave RAM until MemAvailable >= ram_margin + bytes, measured after their memory is unmapped. False if it
     // still isn't (an eviction write still queued holds its RAM until written): the caller then doesn't grow the
@@ -252,11 +261,15 @@ private:
         bool dead = false;         // removed from the index while in use; the last user cleans up
         bool no_room = false;      // the disk had no room for it (or evicted it): no idle write until it's used again
         bool ram_only = false;     // never written to disk (a one-shot request's); leaving RAM drops it
+        bool superseded = false;   // a branch its conversation left: never written, first to leave (until used again)
         std::shared_ptr<Entry> base;  // a delta's base (a full entry, tokens[0, base->tokens.size())); null: whole
         int dependents = 0;           // deltas on this entry
         int64_t saved_by = 0;         // the request that put it (log lines; 0: none)
     };
     using EntryPtr = std::shared_ptr<Entry>;
+    // Oldest candidates outside the recent-turn window, longest first. Caller holds mu_; dependencies are checked
+    // at removal time, after older deltas have had a chance to leave. An incoming Checkpoint is not itself a Turn.
+    std::vector<EntryPtr> expired_turns_locked(const int32_t *tokens, int64_t n, int64_t keep_n, Kind incoming) const;
     struct Job {
         EntryPtr e;
         Why why;

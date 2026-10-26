@@ -194,6 +194,8 @@ PromptCache::PromptCache(std::string dir, uint64_t max_bytes, std::string finger
                 opt_.shutdown_seconds, ", expected >= 0");
     STRIX_CHECK(opt_.checkpoints_per_chain >= 1, "PromptCache: checkpoints_per_chain ", opt_.checkpoints_per_chain,
                 ", expected >= 1");
+    STRIX_CHECK(opt_.turns_per_chain >= 1 && opt_.turns_per_chain <= 64, "PromptCache: turns_per_chain ",
+                opt_.turns_per_chain, ", expected 1..64");
     STRIX_CHECK(opt_.max_spares >= 0 && opt_.max_spares <= kMaxSpares, "PromptCache: max_spares ", opt_.max_spares,
                 ", expected 0..", kMaxSpares);
     fs::create_directories(dir_);
@@ -261,7 +263,7 @@ PromptCache::~PromptCache() {
     shutting_down_ = true;
     std::vector<EntryPtr> todo;
     for (const EntryPtr &e : entries_)
-        if (!e->ram.empty() && e->path.empty() && !e->queued && !e->ram_only) todo.push_back(e);
+        if (!e->ram.empty() && e->path.empty() && !e->queued && !e->ram_only && !e->superseded) todo.push_back(e);
     std::sort(todo.begin(), todo.end(), [](const EntryPtr &a, const EntryPtr &b) { return a->last_used > b->last_used; });
     for (const EntryPtr &e : todo)
         if (!e->queued) enqueue_locked(e, Why::Shutdown);  // (a delta's enqueue may have queued its base already)
@@ -433,7 +435,7 @@ bool PromptCache::with_state(const std::vector<int32_t> &prompt, int64_t n,
             idle_cv_.wait_for(lock, std::chrono::milliseconds(50));
         }
         for (Part &p : parts) {
-            p.e->last_used = ++clock_, p.e->touched_s = now_s(), p.e->no_room = false;
+            p.e->last_used = ++clock_, p.e->touched_s = now_s(), p.e->no_room = false, p.e->superseded = false;
             STRIX_CHECK(!p.e->ram.empty() || !p.e->path.empty(), "PromptCache::with_state: the entry of ",
                         p.e->tokens.size(), " tokens is neither in RAM nor on disk");
             if (!p.e->ram.empty()) ++p.e->readers;
@@ -539,21 +541,40 @@ HostBuffer PromptCache::take_buffer() {
     return b;
 }
 
-HostBuffer PromptCache::take_replaced_buffer(const int32_t *tokens, int64_t n, int64_t keep_n) {
+std::vector<PromptCache::EntryPtr> PromptCache::expired_turns_locked(const int32_t *tokens, int64_t n,
+                                                                   int64_t keep_n, Kind incoming) const {
+    std::vector<EntryPtr> chain;
+    for (const EntryPtr &e : entries_)
+        if (e->kind == Kind::Turn && !e->dead && (int64_t)e->tokens.size() < n &&
+            std::memcmp(e->tokens.data(), tokens, e->tokens.size() * sizeof(int32_t)) == 0)
+            chain.push_back(e);
+    std::sort(chain.begin(), chain.end(), [](const EntryPtr &a, const EntryPtr &b) {
+        return a->tokens.size() > b->tokens.size();
+    });
+    const size_t keep = (size_t)opt_.turns_per_chain - (incoming == Kind::Turn ? 1 : 0);
+    if (chain.size() <= keep) return {};
+    chain.erase(chain.begin(), chain.begin() + (int64_t)keep);
+    chain.erase(std::remove_if(chain.begin(), chain.end(), [keep_n](const EntryPtr &e) {
+        return (int64_t)e->tokens.size() == keep_n;
+    }), chain.end());
+    return chain;
+}
+
+HostBuffer PromptCache::take_replaced_buffer(const int32_t *tokens, int64_t n, int64_t keep_n, Kind incoming) {
     STRIX_CHECK(tokens != nullptr && n >= 1, "PromptCache::take_replaced_buffer: ", n, " tokens at ", (const void *)tokens);
     STRIX_CHECK(keep_n >= 0 && keep_n < n, "PromptCache::take_replaced_buffer: keep_n = ", keep_n, ", expected 0..", n - 1);
+    STRIX_CHECK(incoming == Kind::Turn || incoming == Kind::Checkpoint,
+                "PromptCache::take_replaced_buffer: incoming kind must be Turn or Checkpoint");
     std::vector<HostBuffer> trash;
     std::lock_guard<std::mutex> lock(mu_);
-    int best = -1;
-    for (size_t i = 0; i < entries_.size(); ++i) {
-        const Entry &e = *entries_[i];
-        if (e.kind != Kind::Turn || (int64_t)e.tokens.size() >= n || e.ram.empty() || e.readers > 0 || e.queued ||
-            e.dependents > 0 || (int64_t)e.tokens.size() == keep_n)  // a base stays: its deltas need it
-            continue;
-        if (best >= 0 && e.tokens.size() <= entries_[(size_t)best]->tokens.size()) continue;
-        if (std::memcmp(e.tokens.data(), tokens, e.tokens.size() * 4) == 0) best = (int)i;
+    if (find_locked(tokens, n) >= 0) return HostBuffer();  // a duplicate put retires nothing
+    EntryPtr chosen;
+    for (const EntryPtr &e : expired_turns_locked(tokens, n, keep_n, incoming)) {
+        if (e->ram.empty() || e->readers > 0 || e->queued || e->dependents > 0) continue;
+        if (!chosen || e->ram.capacity() > chosen->ram.capacity()) chosen = e;
     }
-    if (best < 0) return HostBuffer();
+    if (!chosen) return HostBuffer();
+    const int best = find_locked(chosen.get());
     Entry &e = *entries_[(size_t)best];
     ram_bytes_ -= e.ram.capacity();
     HostBuffer b = std::move(e.ram);
@@ -629,7 +650,7 @@ int64_t PromptCache::delta_base(const int32_t *tokens, int64_t n, Kind kind) con
     for (const EntryPtr &e : entries_) {
         const int64_t b = (int64_t)e->tokens.size();
         if (e->base || e->dead || b <= best || b >= n) continue;  // whole entries only; deltas don't chain
-        // A Checkpoint's base is never a Turn: the next turn replaces a Turn, and the checkpoint would go with it.
+        // A Checkpoint's base is never a Turn: Turn retention is independent of the user's checkpoints.
         if (kind == Kind::Checkpoint && e->kind == Kind::Turn) continue;
         if (std::memcmp(e->tokens.data(), tokens, (size_t)b * 4) == 0) best = b;
     }
@@ -639,7 +660,7 @@ int64_t PromptCache::delta_base(const int32_t *tokens, int64_t n, Kind kind) con
 }
 
 bool PromptCache::put(std::vector<int32_t> tokens, Kind kind, HostBuffer state, bool ram_only, int64_t base_n,
-                      int64_t saved_by) {
+                      int64_t saved_by, int64_t conversation_n) {
     STRIX_CHECK(saved_by >= 0, "PromptCache::put: saved_by request id ", saved_by, ", expected >= 0");
     STRIX_CHECK(!tokens.empty() && !state.empty(), "PromptCache::put: ", tokens.size(), " tokens, ", state.size(), " state bytes");
     STRIX_CHECK(kind == Kind::System || kind == Kind::Turn || kind == Kind::Checkpoint, "PromptCache::put: kind ",
@@ -647,6 +668,9 @@ bool PromptCache::put(std::vector<int32_t> tokens, Kind kind, HostBuffer state, 
     STRIX_CHECK(base_n >= 0 && base_n < (int64_t)tokens.size() && (base_n == 0 || kind != Kind::System),
                 "PromptCache::put: base of ", base_n, " tokens for a kind ", (uint32_t)kind, " entry of ", tokens.size(),
                 " (a delta is a Turn or a Checkpoint on a shorter base)");
+    STRIX_CHECK(conversation_n >= 0 && conversation_n <= (int64_t)tokens.size() && (conversation_n == 0 || kind == Kind::Turn),
+                "PromptCache::put: conversation of ", conversation_n, " tokens for a kind ", (uint32_t)kind, " entry of ",
+                tokens.size(), " (only a Turn names its conversation, within its own tokens)");
     std::vector<HostBuffer> trash;
     std::lock_guard<std::mutex> lock(mu_);
     EntryPtr base;
@@ -664,7 +688,7 @@ bool PromptCache::put(std::vector<int32_t> tokens, Kind kind, HostBuffer state, 
     }
     if (const int i = find_locked(tokens.data(), (int64_t)tokens.size()); i >= 0) {
         Entry &e = *entries_[(size_t)i];
-        e.last_used = ++clock_, e.touched_s = now_s(), e.no_room = false;  // already there
+        e.last_used = ++clock_, e.touched_s = now_s(), e.no_room = false, e.superseded = false;  // already there
         if (!ram_only) e.ram_only = false;  // a request that may continue it wants it on disk too
         if (e.ram.empty() && !e.dead) {  // on disk only: this copy saves the next hit a read
             ram_bytes_ += state.capacity();
@@ -676,21 +700,32 @@ bool PromptCache::put(std::vector<int32_t> tokens, Kind kind, HostBuffer state, 
         trash.swap(trash_);
         return true;
     }
-    // A new turn or checkpoint replaces the turns it extends (the same conversation, one step further); checkpoints
-    // stay. In RAM this is where most of the old per-turn disk writes disappear.
+    // Keep recent generation-prompt endpoints for clients that rewrite a recent message (e.g. hide an image).
+    // The old ancestors and their buffers may leave; recent Turns remain subject to ordinary RAM/disk eviction.
     const size_t n = tokens.size();
     // (Collected first: removing a base also removes its deltas, which shifts indices.)
     if (kind == Kind::Turn || kind == Kind::Checkpoint) {
-        std::vector<Entry *> replaced;
-        for (const EntryPtr &e : entries_)
-            if (e->kind == Kind::Turn && e != base && e->tokens.size() < n &&
-                std::memcmp(e->tokens.data(), tokens.data(), e->tokens.size() * 4) == 0)
-                replaced.push_back(e.get());
-        for (Entry *r : replaced)
-            if (const int k = find_locked(r); k >= 0) {  // (a delta may have gone with its base already)
+        for (const EntryPtr &r : expired_turns_locked(tokens.data(), (int64_t)n, base_n, kind))
+            if (const int k = find_locked(r.get()); k >= 0 && r->dependents == 0) {
                 remove_locked((size_t)k);
                 ++stats_.replaced;
             }
+    }
+    // Branches this conversation left: its other Turns that are not prefixes of this one (see "Kinds"). Prefixes
+    // (the retained ancestors, a base) are the branch it is on, so a client that came back clears their mark.
+    if (conversation_n > 0) {
+        for (const EntryPtr &e : entries_) {
+            if (e->kind != Kind::Turn || e->dead || (int64_t)e->tokens.size() < conversation_n ||
+                std::memcmp(e->tokens.data(), tokens.data(), (size_t)conversation_n * 4) != 0)
+                continue;
+            const bool prefix = e->tokens.size() < n && std::memcmp(e->tokens.data(), tokens.data(), e->tokens.size() * 4) == 0;
+            if (prefix) {
+                e->superseded = false;
+            } else if (!e->superseded) {
+                e->superseded = true, e->last_used = 0;
+                ++stats_.superseded;
+            }
+        }
     }
     // Checkpoints per conversation: the older ones this one extends, beyond the newest checkpoints_per_chain - 1, go.
     if (kind == Kind::Checkpoint) {
@@ -880,8 +915,8 @@ void PromptCache::make_room_locked(uint64_t extra, uint64_t avail_in) {
             drop_ram_locked(*lru, false);
             continue;
         }
-        if (lru->ram_only) {  // never written: gone
-            ++stats_.ram_only_dropped;
+        if (lru->ram_only || lru->superseded) {  // never written: gone
+            ++(lru->ram_only ? stats_.ram_only_dropped : stats_.superseded_dropped);
             remove_locked((size_t)find_locked(lru), false);
             continue;
         }
@@ -958,7 +993,7 @@ void PromptCache::summary_locked(double now) {
 void PromptCache::write_idle_locked(double now) {
     if (shutting_down_) return;
     for (const EntryPtr &e : entries_) {
-        if (e->ram.empty() || !e->path.empty() || e->queued || e->no_room || e->ram_only ||
+        if (e->ram.empty() || !e->path.empty() || e->queued || e->no_room || e->ram_only || e->superseded ||
             now - e->touched_s < opt_.idle_seconds)
             continue;
         const uint64_t total = write_bytes_locked(*e);

@@ -637,6 +637,8 @@ void HttpServer::routes() {
             disk.set("ram_hits", json::Value::integer(d.ram_hits));
             disk.set("ram_evicted", json::Value::integer(d.ram_evicted));
             disk.set("ram_only_dropped", json::Value::integer(d.ram_only_dropped));
+            disk.set("superseded", json::Value::integer(d.superseded));
+            disk.set("superseded_dropped", json::Value::integer(d.superseded_dropped));
             disk.set("room_refused", json::Value::integer(d.room_refused));
             disk.set("room_waits", json::Value::integer(d.room_waits));
             disk.set("turn_buffers_reused", json::Value::integer(d.turn_buffers_reused));
@@ -761,6 +763,11 @@ void HttpServer::routes() {
             metric("strix_prompt_cache_ram_evicted_total", "counter", "Entries that left RAM for lack of memory.", (double)d.ram_evicted);
             metric("strix_prompt_cache_ram_only_dropped_total", "counter",
                    "One-shot requests' entries that left RAM (never written to disk, by design).", (double)d.ram_only_dropped);
+            metric("strix_prompt_cache_superseded_total", "counter",
+                   "Turns of branches their conversation left (a rewritten message): never written, first to leave.",
+                   (double)d.superseded);
+            metric("strix_prompt_cache_superseded_dropped_total", "counter",
+                   "Superseded turns that left RAM unwritten.", (double)d.superseded_dropped);
             metric("strix_prompt_cache_room_refused_total", "counter",
                    "Saves skipped or disk loads refused: no room in RAM above the margin.", (double)d.room_refused);
             metric("strix_prompt_cache_room_waits_total", "counter",

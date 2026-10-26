@@ -647,6 +647,14 @@ void Engine::run(Job &job, Slot &sl) {
         // The user-turn checkpoint: only for user turns, only past the system prefix (the first user message's
         // start is the system entry) and not behind the resume point (then it was saved by an earlier request).
         const int64_t ust = cache_ && req.user_turn && ustart > sys && ustart >= start ? ustart : -1;
+        // The conversation a Turn entry belongs to (PromptCache "Kinds"): the prompt up to the end of its first message
+        // after the system prompt. Conversations that share only the system prompt (an agent batch's task) differ there.
+        int64_t conversation = 0;
+        for (int64_t k = sys + 1; sys > 0 && k <= cut && k < P; ++k)
+            if (prompt[(size_t)k] == im_start_) {
+                conversation = k;
+                break;
+            }
         // Logits rows as the sampler takes them: for greedy / top_k 1..20 (the served defaults) each row's top 20
         // candidates, reduced where the logits are (kernels/logits_topk on the real model) - ~160 bytes a row to the
         // host instead of ~1 MB and a full-row scan; same tokens either way.
@@ -1159,7 +1167,7 @@ void Engine::run(Job &job, Slot &sl) {
                 // A Turn of a deep conversation goes as a delta on the whole entry it extends (PromptCache "Delta entries").
                 const int64_t base_n = cache_->delta_base(prompt.data(), n, kind);
                 HostBuffer state = kind == PromptCache::Kind::System ? HostBuffer()
-                                                                      : cache_->take_replaced_buffer(prompt.data(), n, base_n);
+                                                                      : cache_->take_replaced_buffer(prompt.data(), n, base_n, kind);
                 if (state.capacity() == 0) state = cache_->take_buffer();
                 // Room before the buffer grows (PromptCache::make_room_for): else no save - never past the margin.
                 const uint64_t want = sl.be->snapshot_bytes(slot, base_n);
@@ -1186,7 +1194,7 @@ void Engine::run(Job &job, Slot &sl) {
                          fmt_rate(state.size() / 1e6, 0).c_str(), fmt_rate(ms, 0).c_str());
                 rows++;
                 if (!cache_->put(std::vector<int32_t>(prompt.begin(), prompt.begin() + n), kind, std::move(state),
-                                 req.one_shot, base_n, req.id))
+                                 req.one_shot, base_n, req.id, kind == PromptCache::Kind::Turn ? conversation : 0))
                     return;
                 ++saved;
             };
