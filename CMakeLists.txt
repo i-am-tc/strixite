@@ -263,3 +263,10 @@ target_link_libraries(strix_server PRIVATE strix_serve_model)
 if(EXISTS "${CMAKE_SOURCE_DIR}/tutorial/CMakeLists.txt")
     add_subdirectory(tutorial)
 endif()
+
+# CPU-only tests of the prompt cache: turn retention, superseded branches, memory pressure, options.
+foreach(test prompt_cache_turns prompt_cache_regression prompt_cache_memory_pressure prompt_cache_turns_config)
+    add_executable(strix_${test} tests/${test}.cpp)
+    target_include_directories(strix_${test} SYSTEM PRIVATE "${CMAKE_SOURCE_DIR}/third_party/cpp-httplib")
+    target_link_libraries(strix_${test} PRIVATE strix_serve)
+endforeach()
