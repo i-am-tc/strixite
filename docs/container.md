@@ -179,4 +179,6 @@ podman run --rm --device /dev/kfd --device /dev/dri --group-add keep-groups --se
 ```
 
 The image is built from the release tag with `deploy/container/build-image.sh`, so you can build it yourself from
-source if you prefer.
+source if you prefer. The script requires the toolchain tarball's checksum as a `.sha256` file next to it
+(`sha256sum <tarball> > <tarball>.sha256` after a download you watched succeed - AMD publishes the tarball
+without an official checksum, so pin one and keep it).
