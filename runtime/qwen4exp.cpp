@@ -939,6 +939,47 @@ void Qwen4ExpSession::set_positions(std::vector<int64_t> pos3) {
     st().pending3 = std::move(pos3);
 }
 
+// stage_positions: prepare_positions' staging half, without the checks / ensure_rows / upload / globals. It
+// makes the same three decisions for the span [seq, seq+n) - a row with a non-scalar triple anywhere in the
+// block window [4*(seq/4), seq+n) (window_diff), one in the forward's own span [seq, seq+n) (span_diff), and
+// whether rows go up at all (uploaded) - and when they do, appends the window's rows [t0, seq+n) to `out`:
+// scalar rows materialized at r + rope_delta below / past the history, real history rows in between (rows
+// below a restored tail history are the scalar continuation - restore refuses image resumes).
+// prepare_positions uploads `out` whole into its two views; forward_batch's multi-run branch stages every
+// run's window into one buffer end to end (issue #29: the runs' spans overlap, one shared upload's slices
+// can't collide) and hands each run the view of its own slice.
+Qwen4ExpSession::PosWindow Qwen4ExpSession::stage_positions(Qwen4ExpSeqState &sq, int64_t seq, int64_t n,
+                                                            std::vector<int64_t> &out) {
+    PosWindow w{};
+    w.t0 = (seq / kernels::kQsaBlock) * kernels::kQsaBlock;  // the block window's first row
+    const int64_t hstart = sq.pos3_start, hend = sq.pos3Hend();  // the history holds rows [hstart, hend)
+    for (int64_t r = std::max(w.t0, hstart); r < std::min(hend, seq + n); ++r) {
+        const int64_t *tr = sq.pos3_host.data() + (size_t)((r - hstart) * 3);
+        const int64_t v = (r + sq.rope_delta);
+        const bool differs = !(tr[0] == v && tr[1] == v && tr[2] == v);
+        w.span_diff = w.span_diff || (r >= seq && differs);
+        w.window_diff = w.window_diff || differs;
+    }
+    w.uploaded = w.window_diff || sq.rope_delta != 0;  // (delta is <= 0 once a block packed positions ahead)
+    if (!w.uploaded) return w;  // span_diff implies window_diff implies uploaded - pure text: nothing staged
+    w.rows = seq + n - w.t0;
+    const int64_t hs = std::max(w.t0, hstart), he = std::max(hs, std::min(hend, seq + n));
+    const size_t at = out.size();
+    out.resize(at + (size_t)(w.rows * 3));
+    int64_t *d = out.data() + at;
+    auto push_scalar = [&](int64_t r) {
+        const int64_t v = (r + sq.rope_delta);
+        d[0] = d[1] = d[2] = v;
+        d += 3;
+    };
+    for (int64_t r = w.t0; r < hs; ++r) push_scalar(r);
+    if (hs < he)
+        std::copy(sq.pos3_host.begin() + (hs - hstart) * 3, sq.pos3_host.begin() + (he - hstart) * 3, d);
+    d += (he - hs) * 3;
+    for (int64_t r = he; r < seq + n; ++r) push_scalar(r);
+    return w;
+}
+
 // Point the rope triple array at the forward's block span [4*(seq/4), seq+n) and fill mk_block_ / mk_jobs_.
 // The span starts at the block boundary because qsa_block_keys ropes a completing block at its first key,
 // which for the first block can be a tail row before seq; the jobs read rows [seq, seq+n) at the same
@@ -964,54 +1005,30 @@ void Qwen4ExpSession::prepare_positions(Qwen4ExpSeqState &sq, int64_t seq, int64
     // past the last forward: the paged K/V for the span is mapped now.
     ensure_rows(sq, seq + n);
     mk_block_ = kernels::MropePos{}, mk_jobs_ = kernels::MropePos{};
-    const int64_t t0 = (seq / kernels::kQsaBlock) * kernels::kQsaBlock;  // the block span's first row
-    const int64_t hstart = sq.pos3_start, hend = sq.pos3Hend();  // the history holds rows [hstart, hend)
-    bool span_diff = false;  // a row of the forward's span [seq, seq+n) with a non-scalar triple
-    bool window_diff = false;  // ... or anywhere in the block window [t0, seq+n)
-    for (int64_t r = std::max(t0, hstart); r < std::min(hend, seq + n); ++r) {
-        const int64_t *tr = sq.pos3_host.data() + (size_t)((r - hstart) * 3);
-        const int64_t v = (r + sq.rope_delta);
-        const bool differs = !(tr[0] == v && tr[1] == v && tr[2] == v);
-        span_diff = span_diff || (r >= seq && differs);
-        window_diff = window_diff || differs;
-    }
-    const bool uploaded = window_diff || sq.rope_delta != 0;  // (delta is <= 0 once a block packed positions ahead)
+    stage3_.clear();
+    const PosWindow w = stage_positions(sq, seq, n, stage3_);
     UploadTrace probe{seq, n, -1, -1, -1, -1};
     auto finish = [&] {
-        if (uploaded) {  // hand the kernels their views (the calls re-validate base / rows / alignment)
-            mk_block_ = kernels::MropePos{pos3_dev_.get(), seq + n - t0, t0};
-            probe.block_base = t0, probe.block_rows = seq + n - t0;
+        if (w.uploaded) {  // hand the kernels their views (the calls re-validate base / rows / alignment)
+            mk_block_ = kernels::MropePos{pos3_dev_.get(), w.rows, w.t0};
+            probe.block_base = w.t0, probe.block_rows = w.rows;
         }
-        if (span_diff) {
-            mk_jobs_ = kernels::MropePos{pos3_dev_.get() + (size_t)((seq - t0) * 3), n, seq};
+        if (w.span_diff) {
+            mk_jobs_ = kernels::MropePos{pos3_dev_.get() + (size_t)((seq - w.t0) * 3), n, seq};
             probe.jobs_base = seq, probe.jobs_rows = n;
         }
         trace_upload(probe);
     };
-    if (!uploaded) return finish();  // span_diff implies window_diff implies uploaded - pure text: both null
-    // Stage [t0, seq + n): scalar-materialized rows below / past the history, real history rows in between
-    // (rows below a restored tail history are the scalar continuation - restore refuses image resumes).
-    const int64_t rows = seq + n - t0;
-    stage3_.clear();
-    stage3_.reserve((size_t)(rows * 3));
-    const int64_t hs = std::max(t0, hstart), he = std::max(hs, std::min(hend, seq + n));
-    auto push_scalar = [&](int64_t r) {
-        const int64_t v = (r + sq.rope_delta);
-        stage3_.insert(stage3_.end(), {v, v, v});
-    };
-    for (int64_t r = t0; r < hs; ++r) push_scalar(r);
-    if (hs < he)
-        stage3_.insert(stage3_.end(), sq.pos3_host.begin() + (hs - hstart) * 3, sq.pos3_host.begin() + (he - hstart) * 3);
-    for (int64_t r = he; r < seq + n; ++r) push_scalar(r);
-    STRIX_CHECK((int64_t)stage3_.size() == rows * 3, fn, ": staged ", stage3_.size() / 3, " rows for the span [", t0,
-                ", ", seq + n, ")");
+    if (!w.uploaded) return finish();  // span_diff implies window_diff implies uploaded - pure text: both null
+    STRIX_CHECK((int64_t)stage3_.size() == w.rows * 3, fn, ": staged ", stage3_.size() / 3, " rows for the span [",
+                w.t0, ", ", seq + n, ")");
     if (pos3_dev_.size() == 0)  // (get() throws on the empty buffer - size() is the allocation test)
         pos3_dev_ = DeviceBuffer<int64_t>((size_t)capacity_ * 3, "mRoPE triples");
     // stage3_ is pageable, not pinned: moving it to a pinned buffer needs an event gate before its next write
     // (the gfx1151 pinned-reuse hazard).
-    STRIX_HIP_CHECK(hipMemcpyAsync(pos3_dev_.get(), stage3_.data(), (size_t)(rows * 3) * sizeof(int64_t),
+    STRIX_HIP_CHECK(hipMemcpyAsync(pos3_dev_.get(), stage3_.data(), (size_t)(w.rows * 3) * sizeof(int64_t),
                                    hipMemcpyHostToDevice, stream_),
-                    fn, ": uploading rows [", t0, ", ", seq + n, ")");
+                    fn, ": uploading rows [", w.t0, ", ", seq + n, ")");
     finish();
 }
 
@@ -1739,6 +1756,9 @@ std::vector<float> Qwen4ExpSession::forward_batch(std::vector<BatchRun> &batch, 
         bool fresh;               // the run starts at position 0 (the GDN states' reset marker)
         int64_t rope0;            // the scalar-path rope base (the run's pos + its rope_delta)
         std::future<void> ple_ready;  // multi-run: this run's PLE gather (joined at the PLE layer)
+        kernels::MropePos jobs{}, block{};  // this run's mRoPE views (null = scalar): a single run gets the
+                                            // session's mk_jobs_ / mk_block_ from prepare_positions, a
+                                            // multi-run forward its own staged window's slice (issue #29)
     };
     std::vector<Run> runs;
     runs.reserve(batch.size());
@@ -1782,10 +1802,12 @@ std::vector<float> Qwen4ExpSession::forward_batch(std::vector<BatchRun> &batch, 
     if (runs.size() > 1) {  // the batch's decode-size scalar contract (see the header's forward_batch)
         STRIX_CHECK(image == nullptr, "Qwen4ExpSession::forward: ", runs.size(),
                     " runs and an image forward - image rows run alone (vision's one-forward-one-image contract)");
-        for (const Run &r : runs)
-            STRIX_CHECK(r.sq->pending3.empty() && !r.sq->history_ever_interleaved && r.sq->rope_delta == 0,
+        for (const Run &r : runs)  // (issue #29: the run's rope_delta / interleaved history are representable
+                                   // per run - the staging pass below; only unconsumed triples disqualify)
+            STRIX_CHECK(r.sq->pending3.empty(),
                         "Qwen4ExpSession::forward: run on seq ", r.seq,
-                        " carries mRoPE position state - a multi-run forward is scalar positions only");
+                        " carries set_positions' rows not in the history yet - an image's triples are consumed "
+                        "by its own forward, which runs alone");
     }
     // Image forward (vision): every check that can fail without touching session state runs here, before
     // the pending positions are consumed. run_tower_and_scatter checks the rest (the row count, against ids).
@@ -1861,22 +1883,63 @@ std::vector<float> Qwen4ExpSession::forward_batch(std::vector<BatchRun> &batch, 
         }
         // Paged K/V for this run's rows (a multi-run forward skips prepare_positions below).
         ensure_rows(sq, r.p + r.Tr);
-        // The batch's last prepared span is what the kernels get (mk_block_ / mk_jobs_): a single run is today's
-        // call; a multi-run forward is scalar-only (checked above) and needs no uploads at all.
+        // A single run is today's prepare_positions call: the session globals become the run's views. A
+        // multi-run forward stages every run's window after this loop (issue #29: the runs' sequence spans
+        // overlap, and one pair of shared globals cannot hold more than one window).
         if (runs.size() == 1) {
             prepare_positions(sq, r.p, r.Tr);
             r.rope0 = mk_jobs_.pos3 == nullptr ? r.p + sq.rope_delta : r.p;  // scalar-path rope base (Phase A:
             // interleaved calls pass the kernels their positions, so pos0 is unused there)
+            r.jobs = mk_jobs_, r.block = mk_block_;
         } else {
-            r.rope0 = r.p;  // scalar with rope_delta 0 (checked above); a pure-text state's rope_pos(p) == p
-            // A multi-run forward is scalar-only (checked above), so it must carry no mRoPE window to the
-            // kernels: clear whatever the last single-run forward prepared. Left stale, an image's triples
-            // (a non-null mk_block_ / mk_jobs_) would be matched against these runs' positions by
-            // qk_norm_rope_jobs / qsa_block_keys - a confusing error, or (p == the stale base) silently
-            // roping text rows with the image's (t,h,w) angles.
-            mk_block_ = {};
-            mk_jobs_ = {};
+            r.rope0 = r.p + sq.rope_delta;  // the scalar base a solo forward of this state would pass (a
+                                            // pure-text state's rope_delta is 0; the window pass below
+                                            // overrides it only for a run whose own rows carry real triples)
         }
+    }
+    if (runs.size() > 1) {
+        // Per-run mRoPE windows (issue #29's fix): every run whose state is not pure scalar stages the block
+        // window prepare_positions would have prepared for it - scalar rows materialized at pos + rope_delta,
+        // image rows' real (t,h,w) triples as they are - so its kernels get bit-identical angles to the same
+        // run alone. The windows are decode-sized (a partial block tail + the run's rows); every staged
+        // window rides one upload of batch3_, and each run views its own slice. A pure-text run stages
+        // nothing: null views + rope0 = p + 0 is exactly the run-alone path. The STRIX_POS_PROBE upload
+        // trace stays a single-run instrument.
+        struct Slice { int64_t at = 0, t0 = 0, rows = 0; bool span_diff = false; };
+        std::vector<Slice> slices(runs.size());
+        batch3_.clear();
+        for (size_t i = 0; i < runs.size(); ++i) {
+            const size_t at = batch3_.size() / 3;
+            const PosWindow w = stage_positions(*runs[i].sq, runs[i].p, runs[i].Tr, batch3_);
+            if (!w.uploaded) continue;
+            slices[i] = {static_cast<int64_t>(at), w.t0, w.rows, w.span_diff};
+        }
+        if (!batch3_.empty()) {
+            const char *bfn = "Qwen4ExpSession::forward(batch)";
+            const int64_t ceil3 = (int64_t)seqs_.size() * (kernels::kQsaBlock - 1) + kMaxLogits;  // every run's
+            // partial-block rows + the batch's rows (the multi-run row contract above caps their total)
+            if (pos3_batch_dev_.size() == 0)
+                pos3_batch_dev_ = DeviceBuffer<int64_t>((size_t)ceil3 * 3, "mRoPE batch triples");
+            STRIX_CHECK((int64_t)(batch3_.size() / 3) <= ceil3, bfn, ": ", batch3_.size() / 3,
+                        " staged mRoPE rows exceed the batch ceiling ", ceil3);
+            // batch3_ is pageable, like stage3_ (the gfx1151 pinned-reuse hazard: no reuse before the copy).
+            STRIX_HIP_CHECK(hipMemcpyAsync(pos3_batch_dev_.get(), batch3_.data(),
+                                           (size_t)batch3_.size() * sizeof(int64_t), hipMemcpyHostToDevice, stream_),
+                            bfn, ": uploading ", batch3_.size() / 3, " staged mRoPE rows for ", runs.size(), " runs");
+            for (size_t i = 0; i < runs.size(); ++i) {
+                Run &r = runs[i];
+                if (slices[i].rows == 0) continue;
+                r.block = kernels::MropePos{pos3_batch_dev_.get() + (size_t)(slices[i].at * 3), slices[i].rows,
+                                            slices[i].t0};
+                r.jobs = slices[i].span_diff
+                             ? kernels::MropePos{pos3_batch_dev_.get() +
+                                                 (size_t)((slices[i].at + r.p - slices[i].t0) * 3), r.Tr, r.p}
+                             : kernels::MropePos{};
+                r.rope0 = r.jobs.pos3 == nullptr ? r.p + r.sq->rope_delta : r.p;  // the solo path's formula
+            }
+        }
+        mk_block_ = {};  // the kernels read the runs' views, never the session globals, in a batch: left
+        mk_jobs_ = {};   // stale, an image window (a non-null mk_block_) must never reach one
     }
     auto at = [&](const DeviceBuffer<uint8_t> &b, int64_t elem) { return b.get() + (size_t)elem * e; };
     const ProbeType pt = act == Act::F32 ? ProbeType::F32 : ProbeType::BF16;
@@ -2132,7 +2195,7 @@ std::vector<float> Qwen4ExpSession::forward_batch(std::vector<BatchRun> &batch, 
                     nr[njobs++] = {at(proj_, r.base * D.astride + D.idx_col + D.idx_h * D.idx_d), D.astride, D.idx_d,
                                    sq.verify_in[(size_t)i].get(), D.idx_d, D.idx_d, 1, D.idx_d, nullptr};
                 kernels::qk_norm_rope_jobs(nr, njobs, r.Tr, D.eps, D.rot, r.rope0, m_.inv_freq(), act, stream_,
-                                           m_.rope_scale(), mk_jobs_);
+                                           m_.rope_scale(), r.jobs);
                 // Indexer block keys (every completed block, this run's included) - kept current for when
                 // selection starts to bite; the queries and scores are only needed past the dense limit.
                 // pos0 stays the sequence index (the kernel derives block / tail array indices from it); with
@@ -2142,7 +2205,7 @@ std::vector<float> Qwen4ExpSession::forward_batch(std::vector<BatchRun> &batch, 
                                         r.Tr, r.p, r.p % kernels::kQsaBlock ? sq.tail[sq.tail_cur][(size_t)i].get() : nullptr,
                                         sq.tail[1 - sq.tail_cur][(size_t)i].get(), D.idx_d, l.idx_k_norm, D.eps,
                                         m_.inv_freq(), D.rot, sq.block_keys[(size_t)i].get(), cap_blocks_, act, stream_,
-                                        m_.rope_scale(), mk_block_);
+                                        m_.rope_scale(), r.block);
                 const kernels::AttentionShape as{r.Tr, r.p, D.hq, D.hkv, hd, D.astride, 2 * hd};
                 const float scale = 1.0f / std::sqrt((float)hd);
                 kernels::Kv8View kv8;
@@ -2379,13 +2442,13 @@ std::vector<float> Qwen4ExpSession::forward_batch(std::vector<BatchRun> &batch, 
                 {at(proj_, r.base * D.astride + D.hq * 2 * hd + D.hkv * hd), D.astride, hd,
                  sq.v_cache_mtp.get() + (size_t)(r.p * D.hkv * hd) * e, D.hkv * hd, hd, D.hkv, hd, nullptr}};
             kernels::qk_norm_rope_jobs(nr, 2, r.Tr, D.eps, D.rot, r.rope0, m_.inv_freq(), act, stream_,
-                                       m_.rope_scale(), mk_jobs_);  // k, v into the MTP cache (at row base)
+                                       m_.rope_scale(), r.jobs);  // k, v into the MTP cache (at row base)
             kernels::qsa_block_keys(at(proj_, r.base * D.astride + D.idx_col + D.idx_h * D.idx_d), D.astride,
                                     r.Tr, r.p,
                                     r.p % kernels::kQsaBlock ? sq.tail_mtp[sq.mtp_tail_cur].get() : nullptr,
                                     sq.tail_mtp[1 - sq.mtp_tail_cur].get(), D.idx_d, ml.idx_k_norm, D.eps,
                                     m_.inv_freq(), D.rot, sq.block_keys_mtp.get(), cap_blocks_, act, stream_,
-                                    m_.rope_scale(), mk_block_);
+                                    m_.rope_scale(), r.block);
             sq.mtp_tail_cur = 1 - sq.mtp_tail_cur;
             STRIX_HIP_CHECK(hipMemcpyAsync(sq.mtp_prev.get(), at(x_, (r.base + r.Tr - 1) * n4), (size_t)n4 * e,
                                            hipMemcpyDeviceToDevice, stream_),

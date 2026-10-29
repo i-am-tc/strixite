@@ -599,8 +599,10 @@ public:
     // results depend on its own slot and ids only, bit for bit; next to the same run alone they are bit-identical
     // when the batch's total rows and the run's own fall on the same side of 1, kGroupedMinTokens and
     // kWmmaMinTokens, otherwise they differ by rounding (tests: forward_qwen4exp_batch_*). Refused while any
-    // verify awaits resolution; with more than one run: no image rows, scalar positions only (the one-sequence
-    // vision / mRoPE path keeps its own code - and an image forward runs on seq 0, set_positions' only slot).
+    // verify awaits resolution; with more than one run: no image rows, and each run brings its own position
+    // state - its scalar base pos + rope_delta and, past an image, its staged block-window triples (issue #29;
+    // batchable() gates what can be packed). An image forward still runs alone - on seq 0, set_positions' only
+    // slot (the one-sequence vision path keeps its own code).
     std::vector<float> forward_batch(std::vector<BatchRun> &runs, const ImageInput *image = nullptr,
                                      const Qwen4ExpProbe &probe = nullptr);
     // forward_batch with the verify mechanism (the batched MTP verify): each run's GDN states write to its
@@ -618,15 +620,16 @@ public:
     void keep_verify(int seq, int64_t rows, int32_t carry = 0);
     void drop_verify(int seq);
     int64_t verify_rows(int seq) const { return seqs_[(size_t)seq]->verify_rows; }  // a pending verify's rows for keep_verify
-    // Can this slot's next forward share one with other slots'? forward_batch's multi-run contract (its
-    // declaration) takes scalar positions only, and what breaks it is the mRoPE position state: the interleaved
-    // history an image leaves behind, the position delta recomputed from it, set_positions' triples not yet
-    // forwarded. The history and the delta are the conversation's for good - resumed out of the prompt cache it
-    // comes back with them (the saved has_image) - so this is a property of the conversation, not of the step:
-    // a slot that once ran an image never shares a batch again.
+    // Can this slot's next forward share one with other slots'? A batch represents every run's position state
+    // on its own (issue #29's fix): its scalar base pos + rope_delta, and - for a conversation that ran an
+    // image - the block-window triples prepare_positions would have uploaded for it, staged per run (see the
+    // staging pass in forward_batch). The one state that still disqualifies a run: set_positions' triples not
+    // forwarded yet - those belong to an image forward, and an image forward runs alone. (Before the fix the
+    // interleaved history / the delta disqualified the conversation for good, and the throw took every run of
+    // a batch that packed it in down with it.)
     bool batchable(int seq) const {
         const Qwen4ExpSeqState &s = *seqs_[(size_t)seq];
-        return s.pending3.empty() && !s.history_ever_interleaved && s.rope_delta == 0;
+        return s.pending3.empty();
     }
     // The third way out of a verify: keep only its first `rows` (1 <= rows < its size) - the state as if forward()
     // had run just ids[0, rows), without running them again (an MTP rejection after rows - 1 accepted drafts; the
@@ -789,6 +792,11 @@ private:
     // The spans prepare_positions() last prepared (see .cpp): mk_block_'s rows start at 4*(seq/4), mk_jobs_'s at
     // seq; both null while the last prepared forward is on today's scalar path.
     kernels::MropePos mk_block_{}, mk_jobs_{};
+    // A multi-run forward's position staging (issue #29): each run stages its block window into batch3_'s own
+    // slice (the runs' sequence spans overlap, the shared globals above hold one window), the slices ride one
+    // upload, and each run's kernels view their slice. Single-run forwards use stage3_ / pos3_dev_ alone.
+    std::vector<int64_t> batch3_;
+    DeviceBuffer<int64_t> pos3_batch_dev_;
     std::vector<int64_t> stage3_;            // host staging for the upload (no allocation on the scalar path)
     // Upload probe for tests (STRIX_POS_PROBE=<dir> env, read once): appends one UploadTrace per prepared span
     // per forward to <dir>/uploads.bin - lets a test see exactly what the kernels would receive, including that
@@ -800,6 +808,11 @@ private:
         int64_t jobs_base, jobs_rows;
     };
     void trace_upload(const UploadTrace &p) const;
+    // stage_positions: prepare_positions' staging half (see .cpp) - the window decisions and the host staging,
+    // no checks / ensure_rows / upload / globals. forward_batch's multi-run branch stages every run here, one
+    // slice each, before one shared upload.
+    struct PosWindow { int64_t t0 = 0, rows = 0; bool uploaded = false, span_diff = false, window_diff = false; };
+    static PosWindow stage_positions(Qwen4ExpSeqState &sq, int64_t seq, int64_t n, std::vector<int64_t> &out);
     // Point pos3_dev_ at the forward's block span [4*(seq/4), seq+n) (uploading whenever a window row differs
     // from the scalar values or the session has a rope_delta) and set mk_block_ / mk_jobs_. Called by every
     // forward body (trunk + MTP parts, after its pending rows joined the history), by keep_verify_prefix and

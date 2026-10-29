@@ -139,8 +139,10 @@ void GpuArbiter::run_batch(std::unique_lock<std::mutex> &lock) {
         const Pending &p = pending_[s];
         const int64_t r = (int64_t)p.run.ids.size();
         if (!runs.empty() && (rows + r > budget || p.cands != cands || p.n_valid != n_valid)) continue;
-        // A run whose slot carries mRoPE position state is not batchable at all: with another run in the forward
-        // it throws (LmBackend::batchable, issue #29) and the throw takes every run of the batch down with it.
+        // A run whose slot has mRoPE rows not in the history yet is not batchable at all: with another run in
+        // the forward it throws (LmBackend::batchable, issue #29) and the throw takes every run of the batch
+        // down with it. (Since the batch took per-run position states, that is only an image's unconsumed
+        // triples - a conversation that ran an image batches again.)
         // So it goes by itself: as the batch when it is the oldest waiting run, otherwise this pack stops in
         // front of it - the batch's runs go now, it goes alone right after, never behind newer arrivals.
         if (!p.batchable) {
